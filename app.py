@@ -24,25 +24,47 @@ interval = st.sidebar.slider("Auto-refresh (secondes)", 0, 60, 0, help="0 = dés
 st.sidebar.write("CSV :", f"`{CSV_PATH}`")
 
 # ---- Fetchers ----
+
 def get_bybit():
+    # endpoint v5
     url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=KASUSDT"
-    r = requests.get(url, timeout=TIMEOUT)
-    r.raise_for_status()
-    j = r.json()
-    it = j["result"]["list"][0]
-    return dict(
-        ex="bybit", pair=PAIR_DISPLAY,
-        last=float(it["lastPrice"]),
-        bid=float(it["bid1Price"]),
-        ask=float(it["ask1Price"]),
-        ts=None,  # Bybit ticker n'a pas de ts; on mettra asof plus bas
-    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+        it = j["result"]["list"][0]
+        return dict(
+            ex="bybit", pair=PAIR_DISPLAY,
+            last=float(it["lastPrice"]),
+            bid=float(it["bid1Price"]),
+            ask=float(it["ask1Price"]),
+            ts=None,
+        )
+    except requests.HTTPError as e:
+        # fallback v3 si 403/5xx
+        if getattr(e.response, "status_code", None) in (403, 429, 500, 503):
+            url2 = "https://api.bybit.com/spot/v3/public/quote/ticker/24hr?symbol=KASUSDT"
+            r2 = requests.get(url2, headers=HEADERS, timeout=TIMEOUT)
+            r2.raise_for_status()
+            j2 = r2.json()["result"]
+            return dict(
+                ex="bybit", pair=PAIR_DISPLAY,
+                last=float(j2["lastPrice"]),
+                bid=float(j2["bidPrice"]),
+                ask=float(j2["askPrice"]),
+                ts=None,
+            )
+        raise
 
 def get_okx():
     url = "https://www.okx.com/api/v5/market/ticker?instId=KAS-USDT"
-    r = requests.get(url, timeout=TIMEOUT)
+    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
-    d = r.json()["data"][0]
+    j = r.json()
+    data = j.get("data", [])
+    if not data:
+        raise RuntimeError(f"empty data from OKX: {j}")
+    d = data[0]
     return dict(
         ex="okx", pair=PAIR_DISPLAY,
         last=float(d["last"]),
