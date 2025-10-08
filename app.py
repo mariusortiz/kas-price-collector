@@ -25,6 +25,12 @@ save_csv = st.sidebar.checkbox("Enregistrer dans un CSV", value=True)
 interval = st.sidebar.slider("Auto-refresh (secondes)", 0, 60, 0, help="0 = désactivé")
 st.sidebar.write("CSV :", f"`{CSV_PATH}`")
 
+outlier_pct = st.sidebar.slider(
+    "Seuil anti-outliers (%)",
+    min_value=1, max_value=15, value=5, step=1,
+    help="Écarte une source si son mid diffère de plus de X % de la médiane provisoire."
+)
+
 st.sidebar.subheader("Sources")
 
 use_kucoin  = st.sidebar.checkbox("KuCoin",  value=True)
@@ -126,8 +132,9 @@ def get_bitget():
 
 def get_bitmart():
     """
-    L'ancien endpoint v2 remonte parfois des valeurs aberrantes.
-    On passe à quotation v3 + contrôle des champs.
+    Bitmart renvoie ici 'data' avec des clés 'bid_px', 'ask_px', 'last', 'ts', 'symbol', …
+    Exemple reçu :
+      {'code': 1000, 'data': {'v_24h': '...', 'bid_px': '0.07509', 'ask_px': '0.07572', 'ts': '...', 'last': '0.07531'}, 'message': 'success'}
     """
     r = requests.get(
         "https://api-cloud.bitmart.com/spot/quotation/v3/ticker",
@@ -136,19 +143,23 @@ def get_bitmart():
     )
     r.raise_for_status()
     j = r.json()
-    d = (j.get("data") or {}).get("ticker")
-    if not d:
+    d = j.get("data")
+    if not isinstance(d, dict):
         raise RuntimeError(f"empty data from bitmart: {j}")
 
+    # champs principaux
     last = float(d["last"])
-    bid  = float(d["buy_one"])   # book best bid
-    ask  = float(d["sell_one"])  # book best ask
+    # certaines versions exposent 'buy_one'/'sell_one', d'autres 'bid_px'/'ask_px'
+    bid = float(d.get("bid_px") or d.get("buy_one"))
+    ask = float(d.get("ask_px") or d.get("sell_one"))
 
-    # garde-fous simples pour éviter le 1.8x fantôme
+    # garde-fou simple pour éviter une valeur délirante
     if not (0.01 < last < 1.0) or not (0.01 < bid < 1.0) or not (0.01 < ask < 1.0):
         raise RuntimeError(f"bitmart out-of-range values: last={last}, bid={bid}, ask={ask}")
 
-    return dict(ex="bitmart", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
+    ts = int(d.get("ts") or 0)
+    return dict(ex="bitmart", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=ts)
+
 
 
 
@@ -161,7 +172,7 @@ if use_bitget:  FETCHERS.append(get_bitget)
 if use_bitmart: FETCHERS.append(get_bitmart)
 
 
-def collect_once():
+ddef collect_once():
     asof = datetime.now(timezone.utc)
     quotes, errors = [], []
 
@@ -175,19 +186,23 @@ def collect_once():
         except Exception as e:
             errors.append(f"{fn.__name__}: {e}")
 
-    # 2) garde-fou contre une valeur délirante (ex: Bitmart à 1.8…)
+    # 2) filtre anti-outliers (paramétrable)
     if len(quotes) >= 2:
         mids = [q["mid"] for q in quotes]
         provisional_med = median(mids)
+        threshold = outlier_pct / 100.0  # <-- slider sidebar
         kept, dropped = [], []
         for q in quotes:
-            # on écarte si |écart| > 5% de la médiane provisoire
-            if abs(q["mid"] - provisional_med) / provisional_med <= 0.05:
+            if provisional_med and abs(q["mid"] - provisional_med) / provisional_med <= threshold:
                 kept.append(q)
             else:
                 dropped.append(q)
         if dropped and kept:
-            errors.append("outliers dropped: " + ", ".join(f"{q['ex']}={q['mid']:.6f}" for q in dropped))
+            errors.append(
+                "outliers dropped (>{:.1f}%): {}".format(
+                    outlier_pct, ", ".join(f"{q['ex']}={q['mid']:.6f}" for q in dropped)
+                )
+            )
             quotes = kept
 
     # 3) agrégats finaux
@@ -208,7 +223,7 @@ def collect_once():
         "spread_max_bps": spread_bps,
         "errors": errors,
     }
-
+    
 def append_csv(payload):
     """Append une ligne synthétique dans CSV_PATH."""
     df_map = {q["ex"]: q for q in payload["quotes"]}
