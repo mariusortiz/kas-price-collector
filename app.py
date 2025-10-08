@@ -8,8 +8,10 @@ from statistics import median
 
 # ---------- Config ----------
 PAIR_DISPLAY = "KAS/USDT"
-CSV_PATH = "data/kas_prices.csv"  # change si besoin
-TIMEOUT = 10                      # seconds
+CSV_PATH = "data/kas_prices.csv"
+TIMEOUT = 10
+# 👉 ajoute cette ligne :
+HEADERS = {"User-Agent": "kas-price-collector/1.0 (+https://for-mining.fr)"}
 # -----------------------------
 
 st.set_page_config(page_title="KAS Price Collector", layout="centered")
