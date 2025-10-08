@@ -1,4 +1,4 @@
-openai>=1.40.0
+openai>=1.51.0
 streamlit>=1.33.0
 tenacity>=8.2.3
 pandas>=2.2.2

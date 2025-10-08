@@ -1,105 +1,124 @@
-import os, json, re, time
-import pandas as pd
+# app.py
+import os
+import re
+import json
 import streamlit as st
-from tenacity import retry, wait_exponential, stop_after_attempt
 from openai import OpenAI
 
-# ------- CONFIG -------
-WORKFLOW_ID = "wf_68e664370e5081909776a87aba127ed602bdfb4"  # <-- ton ID
-MODEL = "gpt-4.1"  # modèle 'driver' du workflow
-# ----------------------
-
-# API key depuis st.secrets ou env
+# -----------------------
+# CONFIG
+# -----------------------
+MODEL = "gpt-4.1"
+WORKFLOW_ID = "wf_68e664370e5081909776a87aba127ed602bdfb4"
 API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+
+st.set_page_config(page_title="KAS Price Oracle — AgentKit x Streamlit", layout="centered")
+st.title("KAS Price Oracle — AgentKit ▶ Streamlit (Debug)")
+
 if not API_KEY:
-    st.error("⚠️ Configure OPENAI_API_KEY dans .streamlit/secrets.toml ou variable d'environnement.")
+    st.error("⚠️ OPENAI_API_KEY manquante. Ajoute-la dans Settings → Secrets ou en variable d'environnement.")
     st.stop()
 
 client = OpenAI(api_key=API_KEY)
 
-st.set_page_config(page_title="KAS Price Oracle (AgentKit + Streamlit)", layout="centered")
-st.title("KAS Price Oracle — AgentKit ▶ Streamlit")
+st.caption("Cette page déclenche ton **workflow AgentKit** publié et affiche la réponse brute, puis en JSON si possible.")
 
-# Sidebar: auto refresh
-st.sidebar.header("Options")
-interval = st.sidebar.slider("Auto-refresh (sec)", 0, 60, 0, help="0 = pas d’auto-refresh")
-max_sources = st.sidebar.number_input("Nb min. de sources valides", min_value=1, max_value=10, value=2, step=1)
 
-# Petit util pour extraire du JSON quelle que soit la forme
-def extract_json_from_text(text: str):
+# -----------------------
+# UTILS
+# -----------------------
+def extract_json(text: str):
+    """Essaie de parser un JSON depuis un texte arbitraire."""
+    if not text:
+        return None
+    # 1) tentative direct
     try:
         return json.loads(text)
     except Exception:
-        # Cherche le premier bloc JSON plausible
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
+        pass
+    # 2) chercher un bloc JSON dans le texte
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
     return None
 
-@retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3))
-def run_workflow():
-    resp = client.responses.create(
-        model=MODEL,
-        # 👇 c’est cette ligne qui peut poser problème selon la version du SDK
-        workflow=WORKFLOW_ID,
-        input=[{"role": "user", "content": "Run KAS collection"}],
-    )
-    text = getattr(resp, "output_text", None) or str(resp)
-    return text, None
 
-placeholder = st.empty()
+# -----------------------
+# CORE: appel du workflow (sans retry, 4 variantes)
+# -----------------------
+def run_workflow_debug():
+    """Tente plusieurs signatures d'appel du workflow selon la version du SDK,
+    et renvoie (raw_text, data_json | None). Affiche les erreurs si toutes échouent.
+    """
+    user_input = [{"role": "user", "content": "Run KAS collection"}]
+    headers = {"OpenAI-Beta": "workflows=v1"}
+    variants = [
+        ("workflow_kw", dict(workflow=WORKFLOW_ID)),  # certaines versions acceptent ce kw
+        ("extra_body.workflow", dict(extra_body={"workflow": WORKFLOW_ID})),
+        ("extra_body.workflow_id", dict(extra_body={"workflow_id": WORKFLOW_ID})),
+        ("extra_body.workflow+version", dict(extra_body={"workflow": WORKFLOW_ID, "version": "1"})),
+    ]
 
-def render_once():
-    with st.spinner("Collecte en cours depuis le workflow AgentKit…"):
-        raw_text, data = run_workflow()
+    errors = []
+    for name, kwargs in variants:
+        try:
+            resp = client.responses.create(
+                model=MODEL,
+                input=user_input,
+                extra_headers=headers,
+                **kwargs,
+            )
+            # Plusieurs formes de retour existent selon versions
+            text = getattr(resp, "output_text", None)
+            if not text:
+                # essaye via model_dump si dispo (pydantic)
+                try:
+                    text = json.dumps(resp.model_dump(), ensure_ascii=False)
+                except Exception:
+                    text = str(resp)
 
-    if not data:
-        st.error("Réponse non JSON. Affichage brut ci-dessous :")
-        st.code(raw_text)
-        return
+            data = extract_json(text)
+            return text, data
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}: {e}")
 
-    # Validation minimum
-    quotes = data.get("quotes", [])
-    median = data.get("median")
-    spread = data.get("spread_max_bps")
-    asof = data.get("asof")
+    # Si rien n'a marché, on affiche tout pour débogage
+    st.error("❌ Toutes les variantes d'appel du workflow ont échoué.")
+    st.code("\n".join(errors))
+    raise RuntimeError("Workflow call failed")
 
-    # Filtrage sources valides
-    df = pd.DataFrame(quotes)
-    if not df.empty:
-        # colonnes attendues
-        for col in ["ex","pair","last","bid","ask","ts"]:
-            if col not in df.columns:
-                df[col] = None
 
-        st.subheader("🧾 Quotes")
-        st.dataframe(
-            df[["ex","pair","last","bid","ask","ts"]].sort_values("ex"),
-            use_container_width=True,
-            hide_index=True
-        )
+# -----------------------
+# UI
+# -----------------------
+col1, col2 = st.columns([1,1])
+with col1:
+    click = st.button("▶ Collecter maintenant", type="primary")
+with col2:
+    auto = st.checkbox("Auto-refresh (10 s)")
 
-    cols = st.columns(3)
-    cols[0].metric("Médiane (mid)", f"{median:.8f}" if isinstance(median,(int,float)) else "—")
-    cols[1].metric("Écart max (bps)", f"{spread:.2f}" if isinstance(spread,(int,float)) else "—")
-    cols[2].metric("Sources reçues", str(len(quotes)))
+def do_run():
+    with st.spinner("Appel du workflow AgentKit…"):
+        raw_text, data = run_workflow_debug()
 
-    st.caption(f"asof = {asof}")
+    st.subheader("Réponse brute")
+    st.code(raw_text)
 
-    # Statut
-    status = "✅ OK" if len(quotes) >= max_sources and isinstance(spread,(int,float)) else "🟠 Dégradé"
-    st.info(f"Statut agrégé : {status}")
+    if data:
+        st.subheader("Interprétation JSON")
+        st.json(data)
+    else:
+        st.info("Aucun JSON valide détecté dans la réponse (normal en phase debug).")
 
-    with st.expander("Réponse JSON complète"):
-        st.code(json.dumps(data, indent=2, ensure_ascii=False))
+if click:
+    do_run()
 
-render_once()
-
-# Auto-refresh basique
-if interval and interval > 0:
-    st.caption(f"Auto-refresh toutes les {interval}s (désactive via la sidebar).")
-    time.sleep(interval)
+if auto:
+    import time
+    do_run()
+    st.caption("Auto-refresh actif (toutes les 10 s). Désactive la case pour arrêter.")
+    time.sleep(10)
     st.rerun()
