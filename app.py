@@ -172,7 +172,7 @@ if use_bitget:  FETCHERS.append(get_bitget)
 if use_bitmart: FETCHERS.append(get_bitmart)
 
 
-ddef collect_once():
+def collect_once():
     asof = datetime.now(timezone.utc)
     quotes, errors = [], []
 
@@ -223,7 +223,7 @@ ddef collect_once():
         "spread_max_bps": spread_bps,
         "errors": errors,
     }
-    
+
 def append_csv(payload):
     """Append une ligne synthétique dans CSV_PATH."""
     df_map = {q["ex"]: q for q in payload["quotes"]}
