@@ -89,46 +89,67 @@ def get_kucoin():
     )
 
 def get_bitget():
-    # v1 ticker (single)
-    url1 = "https://api.bitget.com/api/spot/v1/market/ticker"
-    # v1 tickers (list)
-    url2 = "https://api.bitget.com/api/spot/v1/market/tickers"
+    """
+    Bitget sert des champs différents selon l'endpoint/région.
+    On tente v1 single -> v1 list et on mappe plusieurs noms possibles.
+    """
+    params = {"symbol": "KASUSDT"}
+    # 1) ticker single
     try:
-        r = requests.get(url1, params={"symbol": "KASUSDT"}, headers=HEADERS, timeout=TIMEOUT)
+        r = requests.get("https://api.bitget.com/api/spot/v1/market/ticker",
+                         params=params, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         j = r.json()
         d = j.get("data") or {}
-        last = float(d["close"])
-        bid  = float(d["bestBid"])
-        ask  = float(d["bestAsk"])
-        return dict(ex="bitget", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
     except Exception:
-        r = requests.get(url2, params={"symbol": "KASUSDT"}, headers=HEADERS, timeout=TIMEOUT)
+        # 2) tickers list
+        r = requests.get("https://api.bitget.com/api/spot/v1/market/tickers",
+                         params=params, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         j = r.json()
         arr = j.get("data") or []
         if not arr:
             raise RuntimeError(f"empty data from bitget: {j}")
         d = arr[0]
-        last = float(d["close"])
-        bid  = float(d["bestBid"])
-        ask  = float(d["bestAsk"])
-        return dict(ex="bitget", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
+
+    def pick(*keys):
+        for k in keys:
+            if k in d and d[k] not in (None, "", "0", 0):
+                return float(d[k])
+        raise KeyError(f"missing any of {keys} in bitget payload: {d.keys()}")
+
+    last = pick("close", "last", "lastPr")
+    bid  = pick("bestBid", "buyOne", "bidPr")
+    ask  = pick("bestAsk", "sellOne", "askPr")
+    return dict(ex="bitget", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
+
 
 def get_bitmart():
-    # Doc: GET /spot/v2/ticker?symbol=KAS_USDT
-    url = "https://api-cloud.bitmart.com/spot/v2/ticker"
-    r = requests.get(url, params={"symbol": "KAS_USDT"}, headers=HEADERS, timeout=TIMEOUT)
+    """
+    L'ancien endpoint v2 remonte parfois des valeurs aberrantes.
+    On passe à quotation v3 + contrôle des champs.
+    """
+    r = requests.get(
+        "https://api-cloud.bitmart.com/spot/quotation/v3/ticker",
+        params={"symbol": "KAS_USDT"},
+        headers=HEADERS, timeout=TIMEOUT
+    )
     r.raise_for_status()
     j = r.json()
-    arr = (j.get("data") or {}).get("tickers") or []
-    if not arr:
+    d = (j.get("data") or {}).get("ticker")
+    if not d:
         raise RuntimeError(f"empty data from bitmart: {j}")
-    d = arr[0]
-    last = float(d["last_price"])
-    bid  = float(d["best_bid"])
-    ask  = float(d["best_ask"])
+
+    last = float(d["last"])
+    bid  = float(d["buy_one"])   # book best bid
+    ask  = float(d["sell_one"])  # book best ask
+
+    # garde-fous simples pour éviter le 1.8x fantôme
+    if not (0.01 < last < 1.0) or not (0.01 < bid < 1.0) or not (0.01 < ask < 1.0):
+        raise RuntimeError(f"bitmart out-of-range values: last={last}, bid={bid}, ask={ask}")
+
     return dict(ex="bitmart", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
+
 
 
 
@@ -144,46 +165,72 @@ def collect_once():
     asof = datetime.now(timezone.utc)
     quotes, errors = [], []
 
+    # 1) collecte brute
     for fn in FETCHERS:
         try:
             q = fn()
             q["mid"] = (q["bid"] + q["ask"]) / 2.0
-            q["ts"] = q["ts"] or int(asof.timestamp() * 1000)  # fallback pour Bybit
+            q["ts"] = q["ts"] or int(asof.timestamp() * 1000)  # fallback pour les sources sans ts
             quotes.append(q)
         except Exception as e:
             errors.append(f"{fn.__name__}: {e}")
 
-    med = median([q["mid"] for q in quotes]) if quotes else None
-    spread_bps = (
-        10000.0 * (max(q["mid"] for q in quotes) - min(q["mid"] for q in quotes)) / med
-        if quotes and med else None
-    )
+    # 2) garde-fou contre une valeur délirante (ex: Bitmart à 1.8…)
+    if len(quotes) >= 2:
+        mids = [q["mid"] for q in quotes]
+        provisional_med = median(mids)
+        kept, dropped = [], []
+        for q in quotes:
+            # on écarte si |écart| > 5% de la médiane provisoire
+            if abs(q["mid"] - provisional_med) / provisional_med <= 0.05:
+                kept.append(q)
+            else:
+                dropped.append(q)
+        if dropped and kept:
+            errors.append("outliers dropped: " + ", ".join(f"{q['ex']}={q['mid']:.6f}" for q in dropped))
+            quotes = kept
 
-    return dict(
-        asof_iso=asof.isoformat(timespec="seconds"),
-        quotes=quotes,
-        median=med,
-        spread_max_bps=spread_bps,
-        errors=errors,
-    )
+    # 3) agrégats finaux
+    if quotes:
+        med = median([q["mid"] for q in quotes])
+        spread_bps = (
+            10000.0 * (max(q["mid"] for q in quotes) - min(q["mid"] for q in quotes)) / med
+            if len(quotes) >= 2 else 0.0
+        )
+    else:
+        med = None
+        spread_bps = None
+
+    return {
+        "asof_iso": asof.isoformat(timespec="seconds"),
+        "quotes": quotes,
+        "median": med,
+        "spread_max_bps": spread_bps,
+        "errors": errors,
+    }
 
 def append_csv(payload):
     """Append une ligne synthétique dans CSV_PATH."""
     df_map = {q["ex"]: q for q in payload["quotes"]}
+
     row = {
         "timestamp_iso": payload["asof_iso"],
-        "bybit_last": df_map.get("bybit", {}).get("last", ""),
-        "okx_last": df_map.get("okx", {}).get("last", ""),
-        "kucoin_last": df_map.get("kucoin", {}).get("last", ""),
-        "median_mid": round(payload["median"], 10) if payload["median"] else "",
-        "spread_max_bps": round(payload["spread_max_bps"], 4) if payload["spread_max_bps"] else "",
+        "bybit_last":   df_map.get("bybit",   {}).get("last", ""),
+        "okx_last":     df_map.get("okx",     {}).get("last", ""),
+        "kucoin_last":  df_map.get("kucoin",  {}).get("last", ""),
+        "gate_last":    df_map.get("gate",    {}).get("last", ""),
+        "mexc_last":    df_map.get("mexc",    {}).get("last", ""),
+        "bitmart_last": df_map.get("bitmart", {}).get("last", ""),
+        "bitget_last":  df_map.get("bitget",  {}).get("last", ""),
+        "median_mid": round(payload["median"], 10) if payload["median"] is not None else "",
+        "spread_max_bps": round(payload["spread_max_bps"], 4) if payload["spread_max_bps"] is not None else "",
         "sources_ok": len(payload["quotes"]),
         "errors": " | ".join(payload["errors"]) if payload["errors"] else "",
     }
+
     fieldnames = list(row.keys())
 
-    # assure le dossier
-    import os
+    import os, csv
     os.makedirs(os.path.dirname(CSV_PATH) or ".", exist_ok=True)
     new_file = not os.path.exists(CSV_PATH)
 
@@ -192,6 +239,7 @@ def append_csv(payload):
         if new_file:
             w.writeheader()
         w.writerow(row)
+
 
 # ---- UI controls ----
 col1, col2 = st.columns([1, 1])
