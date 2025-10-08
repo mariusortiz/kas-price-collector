@@ -138,7 +138,7 @@ def render_once():
     out_placeholder.subheader("🧾 Quotes")
     out_placeholder.dataframe(
         df[["ex","pair","last","bid","ask","mid","ts"]].sort_values("ex"),
-        use_container_width=True, hide_index=True
+        use_container_width="stretch", hide_index=True
     )
 
     c1, c2, c3 = st.columns(3)
