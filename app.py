@@ -41,30 +41,14 @@ def extract_json_from_text(text: str):
 
 @retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3))
 def run_workflow():
-    # Appel direct du workflow AgentKit via Responses API
     resp = client.responses.create(
         model=MODEL,
+        # 👇 c’est cette ligne qui peut poser problème selon la version du SDK
         workflow=WORKFLOW_ID,
         input=[{"role": "user", "content": "Run KAS collection"}],
     )
-
-    # Plusieurs SDKs exposent output_text; on gère aussi les structures alternatives
-    text = getattr(resp, "output_text", None)
-    if not text and hasattr(resp, "output"):
-        # concatène tous les morceaux de texte s'il y en a
-        try:
-            text = "".join([
-                (c.get("text", {}).get("value") if isinstance(c, dict) else "")
-                for o in resp.output for c in getattr(o, "content", [])
-            ])
-        except Exception:
-            text = None
-
-    if not text:
-        text = str(resp)
-
-    data = extract_json_from_text(text)
-    return text, data
+    text = getattr(resp, "output_text", None) or str(resp)
+    return text, None
 
 placeholder = st.empty()
 
