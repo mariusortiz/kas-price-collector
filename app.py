@@ -21,7 +21,6 @@ st.caption("Collecte directe via APIs Bybit / OKX / KuCoin, calcule médiane & �
 
 # ---- Sidebar ----
 st.sidebar.header("Options")
-save_csv = st.sidebar.checkbox("Enregistrer dans un CSV", value=True)
 interval = st.sidebar.slider("Auto-refresh (secondes)", 0, 60, 0, help="0 = désactivé")
 st.sidebar.write("CSV :", f"`{CSV_PATH}`")
 
@@ -161,9 +160,6 @@ def get_bitmart():
     return dict(ex="bitmart", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=ts)
 
 
-
-
-
 FETCHERS = []
 if use_kucoin:  FETCHERS.append(get_kucoin)
 if use_gate:    FETCHERS.append(get_gate)
@@ -224,37 +220,6 @@ def collect_once():
         "errors": errors,
     }
 
-def append_csv(payload):
-    """Append une ligne synthétique dans CSV_PATH."""
-    df_map = {q["ex"]: q for q in payload["quotes"]}
-
-    row = {
-        "timestamp_iso": payload["asof_iso"],
-        "bybit_last":   df_map.get("bybit",   {}).get("last", ""),
-        "okx_last":     df_map.get("okx",     {}).get("last", ""),
-        "kucoin_last":  df_map.get("kucoin",  {}).get("last", ""),
-        "gate_last":    df_map.get("gate",    {}).get("last", ""),
-        "mexc_last":    df_map.get("mexc",    {}).get("last", ""),
-        "bitmart_last": df_map.get("bitmart", {}).get("last", ""),
-        "bitget_last":  df_map.get("bitget",  {}).get("last", ""),
-        "median_mid": round(payload["median"], 10) if payload["median"] is not None else "",
-        "spread_max_bps": round(payload["spread_max_bps"], 4) if payload["spread_max_bps"] is not None else "",
-        "sources_ok": len(payload["quotes"]),
-        "errors": " | ".join(payload["errors"]) if payload["errors"] else "",
-    }
-
-    fieldnames = list(row.keys())
-
-    import os, csv
-    os.makedirs(os.path.dirname(CSV_PATH) or ".", exist_ok=True)
-    new_file = not os.path.exists(CSV_PATH)
-
-    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        if new_file:
-            w.writeheader()
-        w.writerow(row)
-
 
 # ---- UI controls ----
 col1, col2 = st.columns([1, 1])
@@ -262,6 +227,28 @@ run_now = col1.button("▶ Collecter maintenant", type="primary")
 auto = col2.checkbox("Auto-refresh (activer)", value=False, help="Utilise l'intervalle choisi dans la sidebar.")
 
 out_placeholder = st.empty()
+
+def csv_bytes_from_quotes(payload):
+    """CSV des quotes courantes (une ligne par exchange)."""
+    import pandas as pd
+    quotes = payload.get("quotes", [])
+    if not quotes:
+        return b""
+    df = pd.DataFrame(quotes)[["ex","pair","last","bid","ask","mid","ts"]]
+    return df.to_csv(index=False).encode("utf-8")
+
+def csv_bytes_from_summary(payload):
+    """CSV d'une seule ligne 'synthèse' (médiane, spread, derniers prix par source)."""
+    row = {"timestamp_iso": payload["asof_iso"],
+           "median_mid": payload["median"],
+           "spread_max_bps": payload["spread_max_bps"],
+           "sources_ok": len(payload["quotes"])}
+    # ajoute dynamiquement les last par exchange
+    for q in payload["quotes"]:
+        row[f"{q['ex']}_last"] = q["last"]
+    import pandas as pd
+    df = pd.DataFrame([row])
+    return df.to_csv(index=False).encode("utf-8")
 
 def render_once():
     payload = collect_once()
@@ -274,9 +261,10 @@ def render_once():
 
     out_placeholder.subheader("🧾 Quotes")
     out_placeholder.dataframe(
-        df[["ex","pair","last","bid","ask","mid","ts"]].sort_values("ex"),
-        use_container_width="stretch", hide_index=True
-    )
+    df[["ex","pair","last","bid","ask","mid","ts"]].sort_values("ex"),
+    width="stretch",  # ✅ remplace l'ancien use_container_width
+    hide_index=True
+)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Médiane (mid)", f"{payload['median']:.8f}" if payload["median"] else "—")
@@ -290,6 +278,23 @@ def render_once():
 
 if run_now:
     render_once()
+
+# --- boutons de téléchargement CSV ---
+ts_safe = payload["asof_iso"].replace(":", "-")
+st.download_button(
+    "⬇️ Télécharger les quotes (CSV)",
+    data=csv_bytes_from_quotes(payload),
+    file_name=f"kas_quotes_{ts_safe}.csv",
+    mime="text/csv",
+    type="secondary",
+)
+st.download_button(
+    "⬇️ Télécharger la ligne synthèse (CSV)",
+    data=csv_bytes_from_summary(payload),
+    file_name=f"kas_summary_{ts_safe}.csv",
+    mime="text/csv",
+    type="secondary",
+)
 
 # boucle d'auto-refresh
 if auto and interval > 0:
