@@ -25,55 +25,55 @@ save_csv = st.sidebar.checkbox("Enregistrer dans un CSV", value=True)
 interval = st.sidebar.slider("Auto-refresh (secondes)", 0, 60, 0, help="0 = désactivé")
 st.sidebar.write("CSV :", f"`{CSV_PATH}`")
 
+st.sidebar.subheader("Sources")
+
+use_kucoin  = st.sidebar.checkbox("KuCoin",  value=True)
+use_gate    = st.sidebar.checkbox("Gate.io", value=True)
+use_mexc    = st.sidebar.checkbox("MEXC",    value=True)
+use_bitget  = st.sidebar.checkbox("Bitget",  value=False)
+use_bitmart = st.sidebar.checkbox("BitMart", value=False)
+# (Bybit et OKX désactivés pour l'instant)
+
 # ---- Fetchers ----
 
-def get_bybit():
-    # endpoint v5
-    url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=KASUSDT"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
-        j = r.json()
-        it = j["result"]["list"][0]
-        return dict(
-            ex="bybit", pair=PAIR_DISPLAY,
-            last=float(it["lastPrice"]),
-            bid=float(it["bid1Price"]),
-            ask=float(it["ask1Price"]),
-            ts=None,
-        )
-    except requests.HTTPError as e:
-        # fallback v3 si 403/5xx
-        if getattr(e.response, "status_code", None) in (403, 429, 500, 503):
-            url2 = "https://api.bybit.com/spot/v3/public/quote/ticker/24hr?symbol=KASUSDT"
-            r2 = requests.get(url2, headers=HEADERS, timeout=TIMEOUT)
-            r2.raise_for_status()
-            j2 = r2.json()["result"]
-            return dict(
-                ex="bybit", pair=PAIR_DISPLAY,
-                last=float(j2["lastPrice"]),
-                bid=float(j2["bidPrice"]),
-                ask=float(j2["askPrice"]),
-                ts=None,
-            )
-        raise
-
-def get_okx():
-    url = "https://www.okx.com/api/v5/market/ticker?instId=KAS-USDT"
-    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+def get_gate():
+    # Doc: GET /api/v4/spot/tickers?currency_pair=KAS_USDT
+    url = "https://api.gateio.ws/api/v4/spot/tickers"
+    r = requests.get(url, params={"currency_pair": "KAS_USDT"}, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     j = r.json()
-    data = j.get("data", [])
-    if not data:
-        raise RuntimeError(f"empty data from OKX: {j}")
-    d = data[0]
-    return dict(
-        ex="okx", pair=PAIR_DISPLAY,
-        last=float(d["last"]),
-        bid=float(d["bidPx"]),
-        ask=float(d["askPx"]),
-        ts=int(d["ts"]),
+    if not j:
+        raise RuntimeError("empty data from gate")
+    d = j[0]
+    last = float(d["last"])
+    bid  = float(d["highest_bid"])
+    ask  = float(d["lowest_ask"])
+    # pas toujours de ts → on homogénéise plus bas
+    return dict(ex="gate", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
+
+
+def get_mexc():
+    # bookTicker → bid/ask
+    bt = requests.get(
+        "https://api.mexc.com/api/v3/ticker/bookTicker",
+        params={"symbol": "KASUSDT"},
+        headers=HEADERS, timeout=TIMEOUT
     )
+    bt.raise_for_status()
+    bb = bt.json()
+    bid = float(bb["bidPrice"])
+    ask = float(bb["askPrice"])
+
+    # last → endpoint price (1 appel léger)
+    pr = requests.get(
+        "https://api.mexc.com/api/v3/ticker/price",
+        params={"symbol": "KASUSDT"},
+        headers=HEADERS, timeout=TIMEOUT
+    )
+    pr.raise_for_status()
+    last = float(pr.json()["price"])
+
+    return dict(ex="mexc", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
 
 def get_kucoin():
     url = "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=KAS-USDT"
@@ -88,7 +88,57 @@ def get_kucoin():
         ts=int(d["time"]),
     )
 
-FETCHERS = [get_bybit, get_okx, get_kucoin]
+def get_bitget():
+    # v1 ticker (single)
+    url1 = "https://api.bitget.com/api/spot/v1/market/ticker"
+    # v1 tickers (list)
+    url2 = "https://api.bitget.com/api/spot/v1/market/tickers"
+    try:
+        r = requests.get(url1, params={"symbol": "KASUSDT"}, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+        d = j.get("data") or {}
+        last = float(d["close"])
+        bid  = float(d["bestBid"])
+        ask  = float(d["bestAsk"])
+        return dict(ex="bitget", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
+    except Exception:
+        r = requests.get(url2, params={"symbol": "KASUSDT"}, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+        arr = j.get("data") or []
+        if not arr:
+            raise RuntimeError(f"empty data from bitget: {j}")
+        d = arr[0]
+        last = float(d["close"])
+        bid  = float(d["bestBid"])
+        ask  = float(d["bestAsk"])
+        return dict(ex="bitget", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
+
+def get_bitmart():
+    # Doc: GET /spot/v2/ticker?symbol=KAS_USDT
+    url = "https://api-cloud.bitmart.com/spot/v2/ticker"
+    r = requests.get(url, params={"symbol": "KAS_USDT"}, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    j = r.json()
+    arr = (j.get("data") or {}).get("tickers") or []
+    if not arr:
+        raise RuntimeError(f"empty data from bitmart: {j}")
+    d = arr[0]
+    last = float(d["last_price"])
+    bid  = float(d["best_bid"])
+    ask  = float(d["best_ask"])
+    return dict(ex="bitmart", pair=PAIR_DISPLAY, last=last, bid=bid, ask=ask, ts=None)
+
+
+
+FETCHERS = []
+if use_kucoin:  FETCHERS.append(get_kucoin)
+if use_gate:    FETCHERS.append(get_gate)
+if use_mexc:    FETCHERS.append(get_mexc)
+if use_bitget:  FETCHERS.append(get_bitget)
+if use_bitmart: FETCHERS.append(get_bitmart)
+
 
 def collect_once():
     asof = datetime.now(timezone.utc)
