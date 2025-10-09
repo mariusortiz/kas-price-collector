@@ -183,6 +183,32 @@ def ob_bitget(depth):
     return (pd.DataFrame(bids, columns=["price","amount"]).sort_values("price", ascending=False),
             pd.DataFrame(asks, columns=["price","amount"]).sort_values("price", ascending=True))
 
+def orderbook_kpis(bids_df: pd.DataFrame, asks_df: pd.DataFrame):
+    """Calcule KPIs instantanés (Niveau 1) pour un carnet."""
+    if bids_df.empty or asks_df.empty:
+        return None
+    best_bid = float(bids_df["price"].max())
+    best_ask = float(asks_df["price"].min())
+    mid = (best_bid + best_ask) / 2.0
+    spread_pct = ((best_ask - best_bid) / mid) * 100 if mid else 0.0
+
+    depth_buy = float(bids_df["amount"].sum())
+    depth_sell = float(asks_df["amount"].sum())
+    total_depth = depth_buy + depth_sell
+    imbalance = ((depth_buy - depth_sell) / total_depth) if total_depth else 0.0
+
+    # Indice simple de "qualité de marché"
+    liq_index = (total_depth / spread_pct) if spread_pct > 0 else float("inf")
+    return {
+        "best_bid": best_bid, "best_ask": best_ask, "mid": mid,
+        "spread_pct": spread_pct, "depth_buy": depth_buy, "depth_sell": depth_sell,
+        "total_depth": total_depth, "imbalance": imbalance, "liquidity_index": liq_index,
+    }
+
+# Mémoire pour les tendances (Niveau 2)
+if "ob_prev" not in st.session_state:
+    st.session_state["ob_prev"] = {}   # ex -> {"mid":..., "imbalance":..., "total_depth":...}
+
 ORDERBOOK_FETCHERS = {
     "gate": ob_gate,
     "mexc": ob_mexc,
@@ -273,17 +299,19 @@ def render_once():
             st.warning(msg)
 
     # --- Orderbooks ---
+    global_best = []  # pour le comparatif inter-exchanges (Niveau 3)
     if show_ob and quotes:
         st.subheader(f"📚 Orderbooks (profondeur {ob_depth})")
-        tabs = st.tabs([q["ex"].upper() for q in quotes if q["ex"] in ORDERBOOK_FETCHERS])
-        tab_i = 0
-        for q in quotes:
-            ex = q["ex"]
-            if ex not in ORDERBOOK_FETCHERS:
-                continue
-            with tabs[tab_i]:
+
+        # onglets uniquement pour les exchanges qui ont un fetcher d'orderbook
+        ex_list = [q["ex"] for q in quotes if q["ex"] in ORDERBOOK_FETCHERS]
+        tabs = st.tabs([ex.upper() for ex in ex_list])
+
+        for tab, ex in zip(tabs, ex_list):
+            with tab:
                 try:
                     bids_df, asks_df = ORDERBOOK_FETCHERS[ex](ob_depth)
+
                     c1, c2 = st.columns(2)
                     with c1:
                         st.markdown("**Bids (acheteurs)**")
@@ -291,9 +319,59 @@ def render_once():
                     with c2:
                         st.markdown("**Asks (vendeurs)**")
                         st.dataframe(asks_df, width="stretch", hide_index=True)
+
+                    # KPIs Niveau 1
+                    k = orderbook_kpis(bids_df, asks_df)
+                    if k is None:
+                        st.info("Carnet vide.")
+                        continue
+
+                    # KPIs Niveau 2 : tendances vs run précédent
+                    prev = st.session_state["ob_prev"].get(ex, {})
+                    delta_mid = (k["mid"] - prev.get("mid")) if "mid" in prev else 0.0
+                    delta_imb = (k["imbalance"] - prev.get("imbalance")) if "imbalance" in prev else 0.0
+                    delta_depth = (k["total_depth"] - prev.get("total_depth")) if "total_depth" in prev else 0.0
+
+                    st.markdown("**KPIs**")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Spread (%)", f"{k['spread_pct']:.3f}")
+                    m2.metric("Imbalance", f"{k['imbalance']:.2f}", delta=f"{delta_imb:+.2f}")
+                    m3.metric("Total depth", f"{k['total_depth']:.0f}", delta=f"{delta_depth:+.0f}")
+                    m4.metric("Mid", f"{k['mid']:.6f}", delta=f"{delta_mid:+.6f}")
+
+                    # stocke pour run suivant
+                    st.session_state["ob_prev"][ex] = {
+                        "mid": k["mid"], "imbalance": k["imbalance"], "total_depth": k["total_depth"]
+                    }
+
+                    # pour comparatif inter-exchanges (Niveau 3)
+                    global_best.append({"ex": ex, "best_bid": k["best_bid"], "best_ask": k["best_ask"],
+                                        "mid": k["mid"], "liq": k["liquidity_index"]})
+
                 except Exception as e:
                     st.warning(f"{ex}: orderbook indisponible — {e}")
-            tab_i += 1
+
+        # KPIs Niveau 3 : comparatif inter-exchanges (si ≥2 carnets)
+        if len(global_best) >= 2:
+            bb = max(global_best, key=lambda x: x["best_bid"])
+            ba = min(global_best, key=lambda x: x["best_ask"])
+            cross_mid = (bb["best_bid"] + ba["best_ask"]) / 2.0
+            cross_spread_pct = ((ba["best_ask"] - bb["best_bid"]) / cross_mid) * 100 if cross_mid else 0.0
+            cross_spread_bps = cross_spread_pct * 100
+
+            st.markdown("### 🌐 KPIs inter-exchanges")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Best Bid", f"{bb['best_bid']:.6f}", help=f"Exchange: {bb['ex'].upper()}")
+            c2.metric("Best Ask", f"{ba['best_ask']:.6f}", help=f"Exchange: {ba['ex'].upper()}")
+            c3.metric("Spread global", f"{cross_spread_pct:.3f}% ({cross_spread_bps:.1f} bps)")
+
+            # Classement "liquidity index" (simple)
+            liq_rank = sorted(global_best, key=lambda x: x["liq"], reverse=True)
+            st.caption("Liquidity index (↑ meilleur)")
+            st.table(pd.DataFrame([{"exchange": x["ex"].upper(),
+                                    "mid": f"{x['mid']:.6f}",
+                                    "liquidity_index": (f"{x['liq']:.0f}" if x['liq'] != float('inf') else "∞")} 
+                                   for x in liq_rank]))
 
     # --- Téléchargements ---
     ts_safe = payload["asof_iso"].replace(":", "-")
